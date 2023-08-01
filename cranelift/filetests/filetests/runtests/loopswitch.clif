@@ -1,0 +1,53 @@
+test interpret
+test run
+target x86_64
+target aarch64
+target s390x
+target riscv64
+
+function %loopswitch() -> i32 {
+
+block0:
+    v0 = iconst.i32 10000000
+    v1 = iconst.i32 0
+    jump block1(v0, v1, v1) 
+
+; v0 = loop counter 
+; v1 = count to be returned 
+; v2 = match variable 
+block1(v3: i32, v4: i32, v5: i32): 
+    v6 = iconst.i32 1
+    v7 = isub v3, v6     
+    brif v7, block2, block10(v4)  
+
+block2:  
+    br_table v5, block3, [block3, block4, block5]
+
+block3:
+    v9 = iconst.i32 100 
+    v10 = iadd v4, v9
+    jump block6(v10)
+
+block4:
+    v11 = iconst.i32 10 
+    v12 = iadd v4, v11
+    jump block6(v12)
+
+block5:
+    v13 = iconst.i32 42 
+    v14 = iadd v4, v13
+    jump block6(v14)
+
+block6(v15: i32):
+    v16 = iconst.i32 1 
+    v17 = iadd v5, v16 
+    v19 = iconst.i32 3 
+    v20 = urem v17, v19 
+    brif v17, block1(v7, v15, v20), block10(v15)
+
+block10(v21: i32):
+    return v21
+}
+; run: %loopswitch() == 506666616
+
+; 11.06s user 0.02s system 99% cpu 11.093 total

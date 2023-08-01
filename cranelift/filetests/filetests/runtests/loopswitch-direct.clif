@@ -1,0 +1,101 @@
+test interpret
+test run
+target x86_64
+target aarch64
+target s390x
+target riscv64
+
+function %loopswitch() -> i32 {
+
+block0:
+    v0 = iconst.i32 10000000
+    v1 = iconst.i32 0
+    jump block1(v0, v1, v1) 
+
+; v0 = loop counter 
+; v1 = count to be returned 
+; v2 = match variable 
+block1(v3: i32, v4: i32, v5: i32): 
+    v6 = iconst.i32 1
+    v7 = isub v3, v6     
+    brif v7, block2, block10(v4)  
+
+block2:  
+    br_table v5, block3(v4, v7, v5), [block3(v4, v7, v5), block4(v4, v7, v5), block5(v4, v7, v5)]
+
+; v600 is the count to be returned 
+; v601 is the loop counter 
+; v602 is the match variable 
+block3(v600:i32, v601: i32, v602: i32):
+    v9 = iconst.i32 100 
+    v10 = iadd v600, v9
+    ; jump block6(v10)
+    v300 = iconst.i32 1 
+    v301 = iadd v602, v300 
+    v302 = iconst.i32 3 
+    v303 = urem v301, v302 
+    brif v301, block100(v601, v10, v303), block10(v10)
+
+block100(v200: i32, v201: i32, v202: i32): 
+    v203 = iconst.i32 1
+    v204 = isub v200, v203     
+    brif v204, block101, block10(v201)  
+
+block101:
+    br_table v202, block3(v201, v204, v202), [block3(v201, v204, v202), block4(v201, v204, v202), block5(v201, v204, v202)]
+
+; v700 is the count to be returned 
+; v701 is the loop counter 
+; v702 is the match variable 
+block4(v700:i32, v701: i32, v702: i32):
+    v11 = iconst.i32 10 
+    v12 = iadd v700, v11
+    ; jump block6(v12)
+    v400 = iconst.i32 1 
+    v401 = iadd v702, v400 
+    v402 = iconst.i32 3 
+    v403 = urem v401, v402 
+    brif v401, block200(v701, v12, v403), block10(v12)
+
+block200(v1000: i32, v1001: i32, v1002: i32): 
+    v1003 = iconst.i32 1
+    v1004 = isub v1000, v1003     
+    brif v1004, block201, block10(v1001)  
+
+block201:
+    br_table v1002, block3(v12, v1004, v1002), [block3(v12, v1004, v1002), block4(v12, v1004, v1002), block5(v12, v1004, v1002)]
+
+; v700 is the count to be returned 
+; v701 is the loop counter 
+; v702 is the match variable 
+block5(v800:i32, v801: i32, v802:i32):
+    v13 = iconst.i32 42 
+    v14 = iadd v800, v13
+    ; jump block6(v14)
+    v100 = iconst.i32 1 
+    v101 = iadd v802, v100 
+    v102 = iconst.i32 3 
+    v103 = urem v101, v102 
+    brif v101, block300(v801, v14, v103), block10(v14)
+
+block300(v1100: i32, v1101: i32, v1102: i32): 
+    v1103 = iconst.i32 1
+    v1104 = isub v1100, v1103     
+    brif v1104, block301, block10(v1101)  
+
+block301:
+    br_table v1102, block3(v14, v1104, v1102), [block3(v14, v1104, v1102), block4(v14, v1104, v1102), block5(v14, v1104, v1102)]
+
+block6(v15: i32):
+    v16 = iconst.i32 1 
+    v17 = iadd v5, v16 
+    v19 = iconst.i32 3 
+    v20 = urem v17, v19 
+    brif v17, block1(v7, v15, v20), block10(v15)
+
+block10(v21: i32):
+    return v21
+}
+; run: %loopswitch() == 506666616
+
+; 12.03s user 0.02s system 99% cpu 12.057 total
