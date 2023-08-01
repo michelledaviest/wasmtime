@@ -9,6 +9,8 @@
 //! contexts concurrently. Typically, you would have one context per compilation thread and only a
 //! single ISA instance.
 
+use core::borrow::BorrowMut;
+
 use crate::alias_analysis::AliasAnalysis;
 use crate::dce::do_dce;
 use crate::dominator_tree::DominatorTree;
@@ -143,7 +145,60 @@ impl Context {
 
         self.optimize(isa)?;
 
+        //println!("BEFORE\n{:?}", self.func);
+        //self.br_tables_opt()?;
+        //println!("AFTER\n{:?}", self.func);
+
+        //self.optimize(isa)?;
+
         isa.compile_function(&self.func, &self.domtree, self.want_disasm, ctrl_plane)
+    }
+
+    fn br_tables_opt(&mut self) -> CodegenResult<()> {
+        // Replace all unconditional jumps (jump blockn) with the block itself
+        //self.compute_domtree();
+        for block in self.domtree.cfg_postorder().iter().rev() {
+            let inst = self.func.layout.last_inst(*block).unwrap();
+            let mut old_to_new_arg = std::collections::HashMap::new();
+            if let crate::ir::InstructionData::Jump {
+                opcode: _,
+                destination,
+            } = self.func.dfg.insts[inst]
+            {
+                let pool = &self.func.stencil.dfg.value_lists;
+                let dest_block = destination.block(pool);
+
+                let dest_args = destination.args_slice(pool);
+                let dest_params = self.func.stencil.dfg.block_params(dest_block);
+                for (&k, &v) in dest_params.iter().zip(dest_args.iter()) {
+                    old_to_new_arg.insert(k, v);
+                }
+
+                self.func.layout.remove_inst(inst);
+                let mut inst = self.func.stencil.layout.first_inst(dest_block);
+                while let Some(dest_inst) = inst {
+                    let new_inst = self.func.stencil.dfg.clone_inst(dest_inst);
+                    self.func
+                        .stencil
+                        .dfg
+                        .map_inst_values(new_inst, |_, old_arg| {
+                            old_to_new_arg.get(&old_arg).copied().unwrap_or(old_arg)
+                        });
+
+                    let old_res = self.func.stencil.dfg.inst_results(dest_inst);
+                    let new_res = self.func.stencil.dfg.inst_results(new_inst);
+                    for (&k, &v) in old_res.iter().zip(new_res.iter()) {
+                        old_to_new_arg.insert(k, v);
+                    }
+
+                    self.func.stencil.layout.append_inst(new_inst, *block);
+                    inst = self.func.stencil.layout.next_inst(dest_inst);
+                }
+            }
+        }
+        //self.domtree.clear();
+        //self.loop_analysis.clear();
+        Ok(())
     }
 
     /// Optimize the function, performing all compilation steps up to
