@@ -4,7 +4,7 @@ target aarch64
 target s390x
 target riscv64
 
-function %loopswitch() -> i32 {
+function %loopswitch() -> i32 system_v  {
 
 block0:
     v0 = iconst.i32 100000000
