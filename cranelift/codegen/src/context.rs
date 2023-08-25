@@ -9,7 +9,6 @@
 //! contexts concurrently. Typically, you would have one context per compilation thread and only a
 //! single ISA instance.
 
-use core::borrow::BorrowMut;
 use std::collections::{HashMap, HashSet};
 
 use crate::alias_analysis::AliasAnalysis;
@@ -17,7 +16,7 @@ use crate::dce::do_dce;
 use crate::dominator_tree::DominatorTree;
 use crate::egraph::EgraphPass;
 use crate::flowgraph::ControlFlowGraph;
-use crate::ir::{Block, Function, Value};
+use crate::ir::{Block, BlockCall, Function, InstructionData, JumpTableData, Opcode, Value};
 use crate::isa::TargetIsa;
 use crate::legalizer::simple_legalize;
 use crate::loop_analysis::LoopAnalysis;
@@ -34,6 +33,7 @@ use crate::{timing, CompileError};
 use alloc::string::String;
 use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
+use cranelift_entity::ListPool;
 
 #[cfg(feature = "souper-harvest")]
 use crate::souper_harvest::do_souper_harvest;
@@ -240,7 +240,9 @@ impl Context {
 
         self.resolve_all_aliases();
 
-        self.maximal_ssa();
+        self.direct_dispatch_interpreter_transform()?;
+        self.compute_cfg();
+        self.compute_domtree();
 
         self.remove_constant_phis(isa)?;
 
@@ -404,6 +406,26 @@ impl Context {
         }
     }
 
+    fn check_for_loop_switch_pattern(&mut self) -> Option<Block> {
+        const BR_TABLE_CASES: usize = 10;
+
+        self.compute_loop_analysis();
+
+        for block in self.func.layout.blocks() {
+            if let Some(inst) = self.func.layout.last_inst(block) {
+                if self.func.dfg.insts[inst].opcode() == Opcode::BrTable {
+                    //if BR_TABLE_CASES < self.cfg.succ_iter(block).count() {
+                    if self.loop_analysis.innermost_loop(block).is_some() {
+                        return Some(block);
+                    }
+                    //}
+                }
+            }
+        }
+
+        None
+    }
+
     fn direct_dispatch_interpreter_transform(&mut self) -> CodegenResult<()> {
         // 1. Find loop-switch pattern, ie, the pattern we want to transform.
         //   1.1. Do loop analysis.
@@ -411,24 +433,150 @@ impl Context {
         //        This is where you can have a hauristic that filters on number of cases in the switch.
         // 2. Now that we have found pattern, apply maximal-ssa transform to the that loop.
         // 3. Direct-dispatch transform
-        //   3.1.
 
-        const LP_HEADER_IN_THRESHOLD: usize = 1;
+        let mut block_map: HashMap<(Block, usize), Block> = HashMap::new();
+        let mut work_q: Vec<(Block, usize)> = Vec::new();
 
-        self.compute_loop_analysis();
-        let mut loop_set = vec![];
+        if let Some(br_table_block) = self.check_for_loop_switch_pattern() {
+            println!("BEFORE MAX {:?}", self.func);
+            self.maximal_ssa();
+            println!("AFTER MAX {:?}", self.func);
 
-        for lp in self.loop_analysis.loops() {
-            let lp_header: Block = self.loop_analysis.loop_header(lp);
-            let lp_header_pred_count = self.cfg.pred_iter(lp_header).count();
+            let entry_block = self.func.layout.entry_block().unwrap();
+            let new_entry_block = self.func.dfg.make_block();
+            self.func.layout.append_block(new_entry_block);
 
-            if lp_header_pred_count >= LP_HEADER_IN_THRESHOLD {
-                loop_set.push(lp_header);
+            work_q.push((entry_block, 0));
+            block_map.insert((entry_block, 0), new_entry_block);
+
+            let mut i = 0;
+            while let Some((org_block, case_num)) = work_q.pop() {
+                println!("LOOPNUM:{i} {:?}", self.func);
+                i += 1;
+
+                let mut value_map: HashMap<Value, Value> = HashMap::new();
+
+                let new_block = block_map.get(&(org_block, case_num)).unwrap();
+                println!("ORG_BLOCK:{org_block:?} NEW_BLOCK:{new_block:?} CASE:{case_num} VALUEMAP {value_map:?}");
+                for old_param in self
+                    .func
+                    .dfg
+                    .block_params(org_block)
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    let ty = self.func.dfg.value_type(old_param);
+                    let new_param = self.func.dfg.append_block_param(*new_block, ty);
+                    value_map.insert(old_param, new_param);
+                    println!("OLD_P:{old_param}, NEW_P:{new_param}");
+                }
+
+                for inst in self.func.layout.block_insts(org_block).collect::<Vec<_>>() {
+                    let new_inst = self.func.dfg.clone_inst(inst);
+                    let mut inst_data = self.func.dfg.insts[new_inst].clone();
+
+                    let clone_block_call = |bc: BlockCall, pool: &mut ListPool<Value>| {
+                        let args = bc.args_slice(pool).iter().cloned().collect::<Vec<_>>();
+                        let target = bc.block(pool);
+                        BlockCall::new(target, &args[..], pool)
+                    };
+                    match &mut inst_data {
+                        InstructionData::BranchTable { opcode, arg, table } => {
+                            let default_block =
+                                self.func.dfg.jump_tables[*table].default_block().clone();
+                            let default_block =
+                                clone_block_call(default_block, &mut self.func.dfg.value_lists);
+
+                            let all_branches = self.func.dfg.jump_tables[*table]
+                                .all_branches()
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            let all_branches = all_branches
+                                .into_iter()
+                                .map(|b| clone_block_call(b, &mut self.func.dfg.value_lists))
+                                .collect::<Vec<_>>();
+
+                            let new_jump_table = self.func.create_jump_table(JumpTableData::new(
+                                default_block,
+                                all_branches.as_slice(),
+                            ));
+
+                            *table = new_jump_table;
+                        }
+                        _ => (),
+                    }
+
+                    self.func.dfg.insts[new_inst] = inst_data;
+
+                    self.func.dfg.map_inst_values(new_inst, |_dfg, arg| {
+                        println!("INST_ARG {arg:?}");
+                        *value_map.get(&arg).unwrap()
+                    });
+
+                    for (&old_result, &new_result) in self
+                        .func
+                        .dfg
+                        .inst_results(inst)
+                        .iter()
+                        .zip(self.func.dfg.inst_results(new_inst).iter())
+                    {
+                        value_map.insert(old_result, new_result);
+                        println!("OLD_R:{old_result}, NEW_R:{new_result}");
+                    }
+
+                    self.func.layout.append_inst(new_inst, *new_block);
+                }
+
+                if let Some(last_inst) = self.func.layout.last_inst(*new_block) {
+                    let mut inst_data = self.func.dfg.insts[last_inst].clone();
+                    let mut dfg = &mut self.func.dfg;
+                    let mut new_block_to_be_added = Vec::new();
+
+                    for case in 0..inst_data.branch_destination(&dfg.jump_tables).len() {
+                        let org_block_target = inst_data.branch_destination(&dfg.jump_tables)[case]
+                            .block(&dfg.value_lists);
+                        let target_case = if org_block == br_table_block {
+                            case
+                        } else {
+                            case_num
+                        };
+
+                        let target_key = (org_block_target, target_case);
+
+                        let new_target_block = match block_map.entry(target_key) {
+                            std::collections::hash_map::Entry::Occupied(o) => *o.get(),
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                let new_block = dfg.make_block();
+                                new_block_to_be_added.push(new_block);
+
+                                work_q.push(target_key);
+                                v.insert(new_block);
+                                new_block
+                            }
+                        };
+
+                        inst_data.branch_destination_mut(&mut dfg.jump_tables)[case]
+                            .set_block(new_target_block, &mut dfg.value_lists);
+                    }
+
+                    for new_block_add in new_block_to_be_added {
+                        self.func.layout.append_block(new_block_add);
+                    }
+
+                    self.func.dfg.insts[last_inst] = inst_data;
+                }
             }
-        }
 
-        for b in loop_set {
-            println!("{b}");
+            // Delete till new_entry block since we have duplicated everything!
+            while let Some(first_block) = self.func.layout.entry_block() {
+                if first_block == new_entry_block {
+                    break;
+                }
+                self.func.layout.remove_block(first_block);
+            }
+            println!("AFTER {:?}", self.func);
         }
 
         Ok(())
