@@ -237,7 +237,11 @@ impl Context {
         if opt_level != OptLevel::None {
             self.dce(isa)?;
         }
+
+        self.resolve_all_aliases();
+
         self.maximal_ssa();
+
         self.remove_constant_phis(isa)?;
 
         if opt_level != OptLevel::None {
@@ -245,6 +249,15 @@ impl Context {
         }
 
         Ok(())
+    }
+
+    fn resolve_all_aliases(&mut self) {
+        for block in self.domtree.cfg_postorder().iter() {
+            let insts: Vec<crate::ir::Inst> = self.func.layout.block_insts(*block).collect();
+            for inst in insts {
+                self.func.dfg.resolve_aliases_in_arguments(inst);
+            }
+        }
     }
 
     fn get_block_params_to_add(&mut self) -> HashMap<Block, HashSet<Value>> {
@@ -397,7 +410,8 @@ impl Context {
         //   1.2. Check if any blocks in the loop end with a branch table instruction.
         //        This is where you can have a hauristic that filters on number of cases in the switch.
         // 2. Now that we have found pattern, apply maximal-ssa transform to the that loop.
-        // 3.
+        // 3. Direct-dispatch transform
+        //   3.1.
 
         const LP_HEADER_IN_THRESHOLD: usize = 1;
 
