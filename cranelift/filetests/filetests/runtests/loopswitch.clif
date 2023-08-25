@@ -22,7 +22,7 @@ block1(v3: i32, v4: i32, v5: i32):
 block2:  
     br_table v5, block3, [block3, block4, block5]
 
-block3:
+block3:  
     v9 = iconst.i32 100 
     v10 = iadd v4, v9
     jump block6(v10)

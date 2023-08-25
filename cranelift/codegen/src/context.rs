@@ -10,13 +10,14 @@
 //! single ISA instance.
 
 use core::borrow::BorrowMut;
+use std::collections::{HashMap, HashSet};
 
 use crate::alias_analysis::AliasAnalysis;
 use crate::dce::do_dce;
 use crate::dominator_tree::DominatorTree;
 use crate::egraph::EgraphPass;
 use crate::flowgraph::ControlFlowGraph;
-use crate::ir::Function;
+use crate::ir::{Block, Function, Value};
 use crate::isa::TargetIsa;
 use crate::legalizer::simple_legalize;
 use crate::loop_analysis::LoopAnalysis;
@@ -236,11 +237,184 @@ impl Context {
         if opt_level != OptLevel::None {
             self.dce(isa)?;
         }
-
+        self.maximal_ssa();
         self.remove_constant_phis(isa)?;
 
         if opt_level != OptLevel::None {
             self.egraph_pass()?;
+        }
+
+        Ok(())
+    }
+
+    fn get_block_params_to_add(&mut self) -> HashMap<Block, HashSet<Value>> {
+        self.compute_cfg();
+        self.compute_domtree();
+
+        let mut updated_block_params_map: HashMap<Block, HashSet<Value>> = HashMap::new();
+        let mut block_variable_scope: HashMap<Block, HashSet<Value>> = HashMap::new();
+
+        // Initialize both so that we can call unwrap on get.
+        for block in self.func.layout.blocks() {
+            updated_block_params_map.insert(block, HashSet::new());
+            block_variable_scope.insert(block, HashSet::new());
+        }
+
+        // Single pass to populate updated_block_params with variables that are used in blocks that aren't in scope.
+        for block in self.domtree.cfg_postorder().iter() {
+            for arg in self.func.dfg.block_params(*block) {
+                block_variable_scope.get_mut(block).unwrap().insert(*arg);
+            }
+
+            for inst in self.func.stencil.layout.block_insts(*block) {
+                // Check that all arguments to an instruction have arguments that are in scope.
+                for arg in self.func.dfg.inst_args(inst) {
+                    if !block_variable_scope.get(block).unwrap().contains(arg) {
+                        updated_block_params_map
+                            .get_mut(block)
+                            .unwrap()
+                            .insert(*arg);
+                    }
+                }
+
+                // Add results of instructions to be in scope
+                for result_var in self.func.dfg.inst_results(inst) {
+                    block_variable_scope
+                        .get_mut(block)
+                        .unwrap()
+                        .insert(*result_var);
+                }
+            }
+
+            // The last instruction of a block might be a branch.
+            // If the instruction is a branch, check that the values passed to the block are in scope.
+            let last_inst = self.func.layout.last_inst(*block).unwrap();
+            let branches =
+                self.func.dfg.insts[last_inst].branch_destination(&self.func.dfg.jump_tables);
+            for branch in branches {
+                for arg in branch.args_slice(&self.func.dfg.value_lists) {
+                    if !block_variable_scope.get(block).unwrap().contains(arg) {
+                        updated_block_params_map
+                            .get_mut(block)
+                            .unwrap()
+                            .insert(*arg);
+                    }
+                }
+            }
+        }
+
+        // TODO: This is in a loop because I think I need to take a fixed point.
+        // But you might be able to remove fixed point if you visit blocks in the right order?
+        loop {
+            let mut map_updated = false;
+            for block in self.domtree.cfg_postorder().iter() {
+                // Propogate new block parameters to all predecessors,
+                // as long as the predecassor does not have the variables defined in their own scope.
+                for pred in self.cfg.pred_iter(*block) {
+                    let pred = &pred.block;
+                    let new_params = updated_block_params_map.get(block).unwrap().clone();
+                    for p in new_params {
+                        if !block_variable_scope.get(pred).unwrap().contains(&p)
+                            && !updated_block_params_map.get(pred).unwrap().contains(&p)
+                        {
+                            map_updated = true;
+                            updated_block_params_map.get_mut(pred).unwrap().insert(p);
+                        }
+                    }
+                }
+            }
+            if map_updated == false {
+                break;
+            }
+        }
+
+        return updated_block_params_map;
+    }
+
+    fn maximal_ssa(&mut self) {
+        let new_block_param_map = self.get_block_params_to_add();
+
+        for block in self.domtree.cfg_postorder().iter() {
+            let mut old_value_to_new: HashMap<Value, Value> = HashMap::new();
+            let mut new_params: Vec<Value> = new_block_param_map
+                .get(&block)
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            new_params.sort();
+
+            // Add each new parameter to the block paramters.
+            for new_param in new_params {
+                let ty = self.func.dfg.value_type(new_param);
+                let new_val = self.func.dfg.append_block_param(*block, ty);
+                old_value_to_new.insert(new_param, new_val);
+            }
+
+            let insts: Vec<_> = self.func.layout.block_insts(*block).collect();
+
+            // Update all inst arguments to refer to new block parameters.
+            for inst in insts {
+                for inst_arg in self.func.dfg.inst_args_mut(inst) {
+                    if let Some(new_val) = old_value_to_new.get(inst_arg) {
+                        *inst_arg = *new_val;
+                    }
+                }
+            }
+
+            // If the last instruction is a branch, update block parameters to have new values
+            // Also check that if the branch target block has new values that need to be passed in because of new block parameters.
+            let last_inst = self.func.layout.last_inst(*block).unwrap();
+            let mut inst_data = self.func.dfg.insts[last_inst].clone();
+            let mut dfg = &mut self.func.dfg;
+            for branch in inst_data.branch_destination_mut(&mut dfg.jump_tables) {
+                for arg in branch.args_slice_mut(&mut dfg.value_lists) {
+                    if let Some(new_val) = old_value_to_new.get(arg) {
+                        *arg = *new_val;
+                    }
+                }
+
+                let mut new_params: Vec<Value> = new_block_param_map
+                    .get(&branch.block(&dfg.value_lists))
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect();
+                new_params.sort();
+
+                for param in new_params {
+                    let new_arg = old_value_to_new.get(&param).cloned().unwrap_or(param);
+                    branch.append_argument(new_arg, &mut dfg.value_lists);
+                }
+            }
+            self.func.dfg.insts[last_inst] = inst_data;
+        }
+    }
+
+    fn direct_dispatch_interpreter_transform(&mut self) -> CodegenResult<()> {
+        // 1. Find loop-switch pattern, ie, the pattern we want to transform.
+        //   1.1. Do loop analysis.
+        //   1.2. Check if any blocks in the loop end with a branch table instruction.
+        //        This is where you can have a hauristic that filters on number of cases in the switch.
+        // 2. Now that we have found pattern, apply maximal-ssa transform to the that loop.
+        // 3.
+
+        const LP_HEADER_IN_THRESHOLD: usize = 1;
+
+        self.compute_loop_analysis();
+        let mut loop_set = vec![];
+
+        for lp in self.loop_analysis.loops() {
+            let lp_header: Block = self.loop_analysis.loop_header(lp);
+            let lp_header_pred_count = self.cfg.pred_iter(lp_header).count();
+
+            if lp_header_pred_count >= LP_HEADER_IN_THRESHOLD {
+                loop_set.push(lp_header);
+            }
+        }
+
+        for b in loop_set {
+            println!("{b}");
         }
 
         Ok(())
