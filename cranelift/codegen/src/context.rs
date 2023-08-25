@@ -414,11 +414,11 @@ impl Context {
         for block in self.func.layout.blocks() {
             if let Some(inst) = self.func.layout.last_inst(block) {
                 if self.func.dfg.insts[inst].opcode() == Opcode::BrTable {
-                    //if BR_TABLE_CASES < self.cfg.succ_iter(block).count() {
-                    if self.loop_analysis.innermost_loop(block).is_some() {
-                        return Some(block);
+                    if BR_TABLE_CASES < self.cfg.succ_iter(block).count() {
+                        if self.loop_analysis.innermost_loop(block).is_some() {
+                            return Some(block);
+                        }
                     }
-                    //}
                 }
             }
         }
@@ -438,9 +438,10 @@ impl Context {
         let mut work_q: Vec<(Block, usize)> = Vec::new();
 
         if let Some(br_table_block) = self.check_for_loop_switch_pattern() {
-            println!("BEFORE MAX {:?}", self.func);
+            //println!("BEFORE MAX {:?}", self.func);
             self.maximal_ssa();
-            println!("AFTER MAX {:?}", self.func);
+            //println!("AFTER MAX {:?}", self.func);
+            //return Ok(());
 
             let entry_block = self.func.layout.entry_block().unwrap();
             let new_entry_block = self.func.dfg.make_block();
@@ -449,15 +450,11 @@ impl Context {
             work_q.push((entry_block, 0));
             block_map.insert((entry_block, 0), new_entry_block);
 
-            let mut i = 0;
             while let Some((org_block, case_num)) = work_q.pop() {
-                println!("LOOPNUM:{i} {:?}", self.func);
-                i += 1;
-
                 let mut value_map: HashMap<Value, Value> = HashMap::new();
 
                 let new_block = block_map.get(&(org_block, case_num)).unwrap();
-                println!("ORG_BLOCK:{org_block:?} NEW_BLOCK:{new_block:?} CASE:{case_num} VALUEMAP {value_map:?}");
+                //println!("ORG_BLOCK:{org_block:?} NEW_BLOCK:{new_block:?} CASE:{case_num} VALUEMAP {value_map:?}");
                 for old_param in self
                     .func
                     .dfg
@@ -469,7 +466,7 @@ impl Context {
                     let ty = self.func.dfg.value_type(old_param);
                     let new_param = self.func.dfg.append_block_param(*new_block, ty);
                     value_map.insert(old_param, new_param);
-                    println!("OLD_P:{old_param}, NEW_P:{new_param}");
+                    //println!("OLD_P:{old_param}, NEW_P:{new_param}");
                 }
 
                 for inst in self.func.layout.block_insts(org_block).collect::<Vec<_>>() {
@@ -491,6 +488,7 @@ impl Context {
                             let all_branches = self.func.dfg.jump_tables[*table]
                                 .all_branches()
                                 .iter()
+                                .skip(1)
                                 .cloned()
                                 .collect::<Vec<_>>();
                             let all_branches = all_branches
@@ -511,7 +509,7 @@ impl Context {
                     self.func.dfg.insts[new_inst] = inst_data;
 
                     self.func.dfg.map_inst_values(new_inst, |_dfg, arg| {
-                        println!("INST_ARG {arg:?}");
+                        //println!("INST_ARG {arg:?}");
                         *value_map.get(&arg).unwrap()
                     });
 
@@ -523,7 +521,7 @@ impl Context {
                         .zip(self.func.dfg.inst_results(new_inst).iter())
                     {
                         value_map.insert(old_result, new_result);
-                        println!("OLD_R:{old_result}, NEW_R:{new_result}");
+                        //println!("OLD_R:{old_result}, NEW_R:{new_result}");
                     }
 
                     self.func.layout.append_inst(new_inst, *new_block);
@@ -576,7 +574,8 @@ impl Context {
                 }
                 self.func.layout.remove_block(first_block);
             }
-            println!("AFTER {:?}", self.func);
+            //println!("we did the transform");
+            //println!("AFTER {:?}", self.func);
         }
 
         Ok(())
